@@ -1,0 +1,31 @@
+# Node.js
+node_modules/
+dist/
+build/
+.npm
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# PlatformIO
+.pio/
+.vscode/ipch/
+.vscode/.browse.vc.db
+.vscode/.browse.vc.db-shm
+.vscode/.browse.vc.db-wal
+
+# Environment and Secrets
+.env
+secrets.h
+mqtt-secrets.json
+config/secrets.json
+
+# IDEs
+.idea/
+.vscode/
+
+# OS Files
+.DS_Store
+Thumbs.db
