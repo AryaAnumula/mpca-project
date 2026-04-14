@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
+#include <limits.h>
 
 // OLED Setup
 #define SCREEN_WIDTH 128
@@ -18,6 +19,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // SPI and RFID Pins
 #define RFID1_CS 5
 #define RFID2_CS 4
+#define RFID_RST_PIN UINT8_MAX
 #define SCK_PIN 14
 #define MISO_PIN 12
 #define MOSI_PIN 13
@@ -27,11 +29,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define BUZZER_PIN   26   
 #define NEOPIXEL_PIN 27   
 #define NUM_PIXELS    8   
+#define USE_POTENTIOMETER 0
+#define DEFAULT_ZONE 1
 Adafruit_NeoPixel pixel(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // RFID Instances
-MFRC522 rfid1(RFID1_CS, 0);
-MFRC522 rfid2(RFID2_CS, 0);
+MFRC522 rfid1(RFID1_CS, RFID_RST_PIN);
+MFRC522 rfid2(RFID2_CS, RFID_RST_PIN);
+bool rfid1Ready = false;
+bool rfid2Ready = false;
 
 // Network settings
 // Keep these in one place and update only these values when network changes.
@@ -61,6 +67,8 @@ unsigned long lastRfid2Scan = 0;
 const unsigned long SCAN_COOLDOWN = 1500;
 const unsigned long WIFI_RETRY_MS = 10000;
 const unsigned long MQTT_RETRY_MS = 5000;
+const int BUZZER_CHANNEL = 0;
+const int BUZZER_RESOLUTION = 8;
 
 // Function Prototypes
 void setupWiFiConnection();
@@ -72,6 +80,9 @@ void showDisplay(const char* prefix, const char* message);
 void indicateStatus(bool granted);
 int getLocationFromPot();
 void scanI2C();
+bool initRfidReader(MFRC522 &reader, const char *name);
+void handleReader(MFRC522 &reader, bool ready, unsigned long &lastScanTime, const char *topic, const char *prefix);
+void beep(int frequency, int durationMs);
 
 // Initialize hardware, network, and feedback devices.
 void setup() {
@@ -99,11 +110,15 @@ void setup() {
   pinMode(RFID2_CS, OUTPUT);
   digitalWrite(RFID1_CS, HIGH);
   digitalWrite(RFID2_CS, HIGH);
-  rfid1.PCD_Init();
-  rfid2.PCD_Init();
+  rfid1Ready = initRfidReader(rfid1, "RFID1");
+  rfid2Ready = initRfidReader(rfid2, "RFID2");
 
+#if USE_POTENTIOMETER
   pinMode(POT_PIN, INPUT);
+#endif
   pinMode(BUZZER_PIN, OUTPUT);
+  ledcSetup(BUZZER_CHANNEL, 1000, BUZZER_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
   pixel.begin();
   pixel.clear();
   pixel.show();
@@ -114,10 +129,14 @@ void setup() {
   client.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
   client.setCallback(mqtt_callback);
 
-  showDisplay("SYS", "System Ready");
-  tone(BUZZER_PIN, 1000, 200);
+  if (!rfid1Ready && !rfid2Ready) {
+    showDisplay("RFID", "Reader check failed");
+  } else {
+    showDisplay("SYS", "Tap RFID Card");
+  }
+  beep(1000, 200);
   delay(250);
-  tone(BUZZER_PIN, 1500, 200);
+  beep(1500, 200);
 }
 
 // Maintain network links and process both RFID readers.
@@ -133,53 +152,59 @@ void loop() {
     client.loop();
   }
 
-  if (millis() - lastRfid1Scan > SCAN_COOLDOWN) {
-    digitalWrite(RFID1_CS, LOW);
-    if (rfid1.PICC_IsNewCardPresent() && rfid1.PICC_ReadCardSerial()) {
-      char tag[32];
-      getTagID(&rfid1, tag);
-      if (strlen(tag) > 0) {
-        int location = getLocationFromPot();
-        char payload[64];
-        snprintf(payload, sizeof(payload), "%s,%d", tag, location);
-        if (client.connected()) {
-          client.publish("rfid/in", payload);
-        }
-        tone(BUZZER_PIN, 2000, 50);
-        char displayMsg[48];
-        snprintf(displayMsg, sizeof(displayMsg), "%s @L%d", tag, location);
-        showDisplay("IN", displayMsg);
-        Serial.printf("IN Tag: %s Location: %d\n", tag, location);
-        lastRfid1Scan = millis();
-      }
-      rfid1.PICC_HaltA();
-    }
-    digitalWrite(RFID1_CS, HIGH);
+  handleReader(rfid1, rfid1Ready, lastRfid1Scan, "rfid/in", "IN");
+  handleReader(rfid2, rfid2Ready, lastRfid2Scan, "rfid/out", "OUT");
+}
+
+// Initialize one RFID reader and verify SPI communication.
+bool initRfidReader(MFRC522 &reader, const char *name) {
+  reader.PCD_Init();
+  delay(10);
+
+  byte version = reader.PCD_ReadRegister(MFRC522::VersionReg);
+  if (version == 0x00 || version == 0xFF) {
+    Serial.printf("%s init failed (VersionReg=0x%02X). Check CS/SCK/MISO/MOSI/GND/3V3.\n", name, version);
+    return false;
   }
 
-  if (millis() - lastRfid2Scan > SCAN_COOLDOWN) {
-    digitalWrite(RFID2_CS, LOW);
-    if (rfid2.PICC_IsNewCardPresent() && rfid2.PICC_ReadCardSerial()) {
-      char tag[32];
-      getTagID(&rfid2, tag);
-      if (strlen(tag) > 0) {
-        int location = getLocationFromPot();
-        char payload[64];
-        snprintf(payload, sizeof(payload), "%s,%d", tag, location);
-        if (client.connected()) {
-          client.publish("rfid/out", payload);
-        }
-        tone(BUZZER_PIN, 2000, 50);
-        char displayMsg[48];
-        snprintf(displayMsg, sizeof(displayMsg), "%s @L%d", tag, location);
-        showDisplay("OUT", displayMsg);
-        Serial.printf("OUT Tag: %s Location: %d\n", tag, location);
-        lastRfid2Scan = millis();
-      }
-      rfid2.PICC_HaltA();
+  Serial.printf("%s ready (VersionReg=0x%02X).\n", name, version);
+  return true;
+}
+
+// Poll one reader, publish scan, and show immediate local feedback.
+void handleReader(MFRC522 &reader, bool ready, unsigned long &lastScanTime, const char *topic, const char *prefix) {
+  if (!ready) return;
+  if (millis() - lastScanTime <= SCAN_COOLDOWN) return;
+  if (!reader.PICC_IsNewCardPresent()) return;
+  if (!reader.PICC_ReadCardSerial()) return;
+
+  char tag[32];
+  getTagID(&reader, tag);
+  if (strlen(tag) > 0) {
+    int location = getLocationFromPot();
+    char payload[64];
+    snprintf(payload, sizeof(payload), "%s,%d", tag, location);
+
+    bool published = false;
+    if (client.connected()) {
+      published = client.publish(topic, payload);
     }
-    digitalWrite(RFID2_CS, HIGH);
+
+    beep(2000, 80);
+    char displayMsg[64];
+    if (published) {
+      snprintf(displayMsg, sizeof(displayMsg), "%s @L%d", tag, location);
+    } else {
+      snprintf(displayMsg, sizeof(displayMsg), "%s (offline)", tag);
+    }
+    showDisplay(prefix, displayMsg);
+
+    Serial.printf("%s Tag: %s Location: %d Published: %s\n", prefix, tag, location, published ? "yes" : "no");
+    lastScanTime = millis();
   }
+
+  reader.PICC_HaltA();
+  reader.PCD_StopCrypto1();
 }
 
 // Scan I2C bus for troubleshooting display issues.
@@ -302,11 +327,15 @@ void showDisplay(const char* prefix, const char* message) {
 
 // Map potentiometer reading into zone location.
 int getLocationFromPot() {
+#if USE_POTENTIOMETER
   int analogVal = analogRead(POT_PIN);
   int location = map(analogVal, 0, 4095, 1, 5);
   if (location < 1) location = 1;
   if (location > 5) location = 5;
   return location;
+#else
+  return DEFAULT_ZONE;
+#endif
 }
 
 // Flash LEDs and buzzer for access result.
@@ -316,8 +345,16 @@ void indicateStatus(bool granted) {
     pixel.setPixelColor(i, color);
   }
   pixel.show();
-  tone(BUZZER_PIN, granted ? 1000 : 300, granted ? 200 : 500);
+  beep(granted ? 1000 : 300, granted ? 200 : 500);
   delay(250);
   pixel.clear();
   pixel.show();
+}
+
+// ESP32 buzzer helper using LEDC PWM.
+void beep(int frequency, int durationMs) {
+  if (frequency <= 0 || durationMs <= 0) return;
+  ledcWriteTone(BUZZER_CHANNEL, frequency);
+  delay(durationMs);
+  ledcWriteTone(BUZZER_CHANNEL, 0);
 }
